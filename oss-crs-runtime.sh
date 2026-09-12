@@ -19,9 +19,12 @@
 # Typical operator sequence:
 #   sudo ./oss-crs-runtime.sh start
 #   <run the OSS-CRS campaign as usual>
-#   sudo ./oss-crs-runtime.sh collect     # while containers are up
-#   <let the campaign finish>
 #   sudo ./oss-crs-runtime.sh stop
+#
+# 'start' launches a background watcher that polls for in-scope containers and
+# runs the collection automatically once their population settles, so collect
+# does not have to be timed by hand. Set NO_WATCH=1 to disable the watcher and
+# run 'collect' manually while containers are up.
 #
 # Produces (in ./oss-crs-runtime):
 #   capture.pcap                 packet capture across all host interfaces
@@ -55,6 +58,15 @@ BENCH_IMAGE="${BENCH_IMAGE:-docker/docker-bench-security:latest}"
 ZAP_IMAGE="${ZAP_IMAGE:-zaproxy/zap-stable:latest}"
 TRIVY_COMPLIANCE="${TRIVY_COMPLIANCE:-docker-cis-1.6.0}"
 CAPTURE_IFACE="${CAPTURE_IFACE:-any}"
+# Capture is restricted to Docker network address space so host traffic is never
+# written to the pcap. The pool covers networks OSS-CRS creates mid-campaign.
+# Set CAPTURE_FILTER to override the generated filter entirely.
+DOCKER_NET_POOL="${DOCKER_NET_POOL:-172.16.0.0/12}"
+# Watcher: polls for in-scope containers and collects automatically, so collect
+# does not have to be timed by hand. Set NO_WATCH=1 to require manual collect.
+POLL_INTERVAL="${POLL_INTERVAL:-15}"   # seconds between polls
+SETTLE_POLLS="${SETTLE_POLLS:-2}"      # consecutive unchanged polls before heavy collection
+NO_WATCH="${NO_WATCH:-0}"
 
 log()  { printf '[*] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -68,9 +80,90 @@ need_docker() { command -v docker >/dev/null && docker info >/dev/null 2>&1 || d
 # digest of a pulled image, for provenance
 img_digest() { docker inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null || echo "unresolved"; }
 
+# BPF filter limiting the capture to Docker network address space, so traffic on
+# the host's own interfaces is never written to the pcap. Unions the subnets of
+# existing Docker networks with the configured pool, which covers networks
+# OSS-CRS creates after the capture starts.
+build_capture_filter() {
+  [ -n "${CAPTURE_FILTER:-}" ] && { printf '%s' "$CAPTURE_FILTER"; return; }
+  local subnets filt="" s
+  subnets=$(docker network ls -q 2>/dev/null | xargs -r docker network inspect 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d=[]
+for n in d:
+    for c in (n.get("IPAM",{}).get("Config") or []):
+        s=c.get("Subnet")
+        if s and ":" not in s: print(s)
+' 2>/dev/null)
+  subnets=$(printf '%s\n%s\n' "$subnets" "$DOCKER_NET_POOL" | sed '/^$/d' | sort -u)
+  while read -r s; do
+    [ -n "$s" ] || continue
+    [ -n "$filt" ] && filt="$filt or "
+    filt="${filt}net $s"
+  done <<< "$subnets"
+  printf '%s' "$filt"
+}
+
+# Polls for in-scope containers. Snapshots posture on every change, and triggers
+# the full collection once the container population has been stable for
+# SETTLE_POLLS polls. Runs in the background from 'start'; exits when 'stop'
+# removes the started marker or creates the halt flag.
+watch_loop() {
+  mkdir -p "$STATE/snapshots"
+  local prev="" cur ids stable=0 n=0 best=0 runs=0
+  local max_runs="${MAX_COLLECTS:-3}"
+  while [ ! -f "$STATE/halt" ] && [ -f "$STATE/started" ]; do
+    mapfile -t ids < <(scoped_containers)
+    if [ "${#ids[@]}" -gt 0 ]; then
+      cur="$(printf '%s\n' "${ids[@]}" | sort | tr '\n' ' ')"
+      if [ "$cur" != "$prev" ]; then
+        docker inspect "${ids[@]}" > "$STATE/snapshots/$(date -u +%s)-$n.json" 2>/dev/null
+        n=$((n+1)); stable=0; prev="$cur"
+      else
+        stable=$((stable+1))
+      fi
+      # Collect once the set is stable, and again if the population later grows,
+      # so the heavy tools reflect the peak container count rather than the
+      # infrastructure-only state that exists before the CRS containers start.
+      if [ "$stable" -ge "$SETTLE_POLLS" ] && [ "${#ids[@]}" -gt "$best" ] && [ "$runs" -lt "$max_runs" ]; then
+        echo "$(now) collecting: ${#ids[@]} containers stable for $stable polls (previous best $best)" >> "$STATE/watch.log"
+        if cmd_collect >> "$STATE/watch.log" 2>&1; then
+          best="${#ids[@]}"; runs=$((runs+1))
+          status watch "collected-${best}-containers-run-${runs}"
+        fi
+      fi
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+  echo "$(now) watcher exiting after $n snapshots, $runs collection(s)" >> "$STATE/watch.log"
+  [ "$runs" -gt 0 ] || status watch "no-collection-triggered"
+}
+
+# Union every container observed across the campaign into containers-inspect.json,
+# so posture covers containers that started and exited at different times.
+merge_snapshots() {
+  python3 - "$OUT_DIR" "$STATE" <<'PY'
+import json, os, sys, glob
+out, state = sys.argv[1], sys.argv[2]
+seen = {}
+files = sorted(glob.glob(os.path.join(state, "snapshots", "*.json")))
+cur = os.path.join(out, "containers-inspect.json")
+if os.path.exists(cur): files.append(cur)
+for f in files:
+    try: arr = json.load(open(f))
+    except Exception: continue
+    for c in arr if isinstance(arr, list) else []:
+        cid = c.get("Id")
+        if cid and cid not in seen: seen[cid] = c
+if seen:
+    json.dump(list(seen.values()), open(cur, "w"))
+print(f"merged {len(files)} snapshot(s) into {len(seen)} distinct container(s)")
+PY
+}
+
 # in-scope running container IDs: name, image, or an attached network contains SCOPE_MATCH
-scoped_containers() {
-  docker ps -q | while read -r id; do
+scoped_containers() {  docker ps -q | while read -r id; do
     docker inspect --format '{{.Id}} {{.Name}} {{.Config.Image}} {{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id" 2>/dev/null
   done | grep -i "$SCOPE_MATCH" | awk '{print $1}'
 }
@@ -89,8 +182,12 @@ cmd_start() {
   docker ps --no-trunc --format '{{json .}}' > "$OUT_DIR/baseline-ps.json" 2>/dev/null
   docker network ls --format '{{json .}}' > "$OUT_DIR/baseline-networks.json" 2>/dev/null
 
-  log "starting packet capture on interface '$CAPTURE_IFACE'"
-  nohup tcpdump -i "$CAPTURE_IFACE" -n -s 0 -U -w "$OUT_DIR/capture.pcap" >"$STATE/tcpdump.log" 2>&1 &
+  CAP_FILTER="$(build_capture_filter)"
+  [ -n "$CAP_FILTER" ] || die "could not build a capture filter; set CAPTURE_FILTER explicitly"
+  printf '%s' "$CAP_FILTER" > "$STATE/capture.filter"
+  log "starting packet capture on '$CAPTURE_IFACE' restricted to Docker networks"
+  log "filter: $CAP_FILTER"
+  nohup tcpdump -i "$CAPTURE_IFACE" -n -s 0 -U -w "$OUT_DIR/capture.pcap" $CAP_FILTER >"$STATE/tcpdump.log" 2>&1 &
   echo $! > "$STATE/tcpdump.pid"
   sleep 1; kill -0 "$(cat "$STATE/tcpdump.pid")" 2>/dev/null && status capture started || { status capture FAILED; warn "tcpdump did not start; see $STATE/tcpdump.log"; }
 
@@ -109,7 +206,23 @@ cmd_start() {
   else
     status falco FAILED; warn "Falco container did not start"
   fi
-  log "started at $(cat "$STATE/started"). Run the campaign, then 'collect' while it is live."
+  if [ "$NO_WATCH" = "1" ]; then
+    status watch disabled
+    log "started at $(cat "$STATE/started"). Watcher disabled; run 'collect' while containers are up, then 'stop'."
+  else
+    rm -f "$STATE/halt"
+    OSS_CRS_RUNTIME_OUT="$OUT_DIR" OSS_CRS_SCOPE="$SCOPE_MATCH" \
+      nohup "$(readlink -f "$0")" __watch >>"$STATE/watch.log" 2>&1 &
+    echo $! > "$STATE/watch.pid"
+    sleep 1
+    if kill -0 "$(cat "$STATE/watch.pid")" 2>/dev/null; then
+      status watch started
+      log "started at $(cat "$STATE/started"). Watcher polling every ${POLL_INTERVAL}s; run the campaign, then 'stop'."
+    else
+      status watch FAILED
+      warn "watcher did not start; run 'collect' manually while containers are up"
+    fi
+  fi
 }
 
 # ============================================================================
@@ -209,6 +322,11 @@ cmd_stop() {
   need_root; need_docker
   [ -f "$STATE/started" ] || die "not started"
   now > "$STATE/stopped"
+
+  log "stopping watcher"
+  touch "$STATE/halt"
+  if [ -f "$STATE/watch.pid" ]; then kill "$(cat "$STATE/watch.pid")" 2>/dev/null; fi
+  merge_snapshots
 
   log "stopping packet capture"
   if [ -f "$STATE/tcpdump.pid" ]; then kill "$(cat "$STATE/tcpdump.pid")" 2>/dev/null; sleep 1; fi
@@ -422,7 +540,7 @@ P=f"""# OSS-CRS Runtime Analysis: Provenance
 | Posture collected (UTC) | {collected} |
 | Capture stopped (UTC) | {stopped} |
 | In-scope selector | containers, images, or networks containing "{scope}" |
-| Capture interface | all host interfaces |
+| Capture filter | {rd(f"{state}/capture.filter","not recorded")} |
 
 ## Tool images and resolved digests
 
@@ -565,13 +683,17 @@ L.append("The remaining tools produce evidence mapped to the families in this ta
 
 L.append("---\n")
 L.append("## 4. Scope\n")
-L.append("Observations cover the window above on the named host. The packet capture spans")
-L.append("all host interfaces, so external destinations include any host traffic during the")
-L.append("window; Docker-network attribution is derived from the network subnets recorded at")
-L.append("collect time. Posture, Docker Bench, nmap, ZAP, and Trivy results reflect the")
-L.append("containers running at collect time only. Containers that started after collect,")
-L.append("or exited before it, are represented in the capture and Falco logs but not in the")
-L.append("posture tables.\n")
+L.append("Observations cover the window above on the named host. The packet capture is")
+L.append("restricted by capture filter to Docker network address space (see")
+L.append("RUNTIME-PROVENANCE.md for the exact filter), so traffic on the host's own")
+L.append("interfaces is not recorded; if other containers ran on this host during the")
+L.append("window, their traffic is in scope of that filter. Docker-network attribution is")
+L.append("derived from the network subnets recorded at collect time. Container posture is")
+L.append("the union of every in-scope container observed while the watcher was running, so")
+L.append("it covers containers that started and exited at different points in the campaign.")
+L.append("Docker Bench, nmap, ZAP, and Trivy results are point-in-time and reflect the")
+L.append("containers running when a collection fired; see the step status in")
+L.append("RUNTIME-PROVENANCE.md for how many collections ran.\n")
 open(f"{out}/RUNTIME-FINDINGS.md","w").write("\n".join(L))
 print(f"RUNTIME-FINDINGS.md: {len(cons)} containers, {len(conn)} connections, {len(fal)} falco events")
 PY
@@ -586,5 +708,6 @@ case "$VERB" in
   collect) cmd_collect ;;
   stop)    cmd_stop ;;
   report)  cmd_report ;;
+  __watch) watch_loop ;;
   *) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

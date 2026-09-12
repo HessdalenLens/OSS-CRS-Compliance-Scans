@@ -118,22 +118,27 @@ sudo apt install tcpdump nmap openscap-scanner scap-security-guide
 
 ### Usage
 
-Four verbs, each a separate invocation, run as root:
+Two steps, run as root:
 
 ```bash
-sudo ./oss-crs-runtime.sh start      # begin capture and Falco, snapshot baseline
+sudo ./oss-crs-runtime.sh start      # begin capture and Falco, start the watcher
 # run the OSS-CRS campaign as you normally would
-sudo ./oss-crs-runtime.sh collect    # WHILE containers are up
-# let the campaign finish
 sudo ./oss-crs-runtime.sh stop       # end capture, run Zeek and OpenSCAP, report
 ```
 
-`report` regenerates the findings document from existing outputs without
-re-running anything.
+`start` launches a background watcher that polls for in-scope containers and
+runs the collection automatically, so there is no step to time by hand. It
+snapshots container posture every time the set changes, collects once the
+population settles, and collects again if the population later grows, which
+covers the case where OSS-CRS starts its infrastructure containers before the
+CRS containers. At `stop`, every container observed during the campaign is
+merged into a single posture record, so the evidence spans the whole run rather
+than one moment in it.
 
-**`collect` must run while containers are live.** Container posture, Docker
-Bench, nmap, ZAP, and Trivy compliance are meaningless once the campaign exits.
-This is the one point where the script couples to your workflow.
+Two additional verbs are available. `collect` runs a collection immediately,
+which is useful with `NO_WATCH=1` or to force an extra pass. `report`
+regenerates the findings document from existing outputs without re-running
+anything.
 
 Output lands in `./oss-crs-runtime`, overridable with `OSS_CRS_RUNTIME_OUT`.
 
@@ -144,6 +149,12 @@ Output lands in `./oss-crs-runtime`, overridable with `OSS_CRS_RUNTIME_OUT`.
 | `OSS_CRS_SCOPE` | `oss-crs` | Substring marking in-scope containers, images, and networks |
 | `OSS_CRS_RUNTIME_OUT` | `./oss-crs-runtime` | Output directory |
 | `CAPTURE_IFACE` | `any` | Capture interface |
+| `DOCKER_NET_POOL` | `172.16.0.0/12` | Address space the capture filter covers |
+| `CAPTURE_FILTER` | generated | Overrides the generated BPF capture filter entirely |
+| `POLL_INTERVAL` | `15` | Seconds between watcher polls |
+| `SETTLE_POLLS` | `2` | Consecutive unchanged polls before a collection fires |
+| `MAX_COLLECTS` | `3` | Cap on automatic collections per campaign |
+| `NO_WATCH` | `0` | Set to `1` to disable the watcher and collect manually |
 | `FALCO_IMAGE`, `ZEEK_IMAGE`, `BENCH_IMAGE`, `ZAP_IMAGE` | `:latest` | Tool images |
 | `TRIVY_COMPLIANCE` | `docker-cis-1.6.0` | Trivy compliance spec |
 
@@ -179,10 +190,29 @@ the profile it used. Every step is guarded, so a missing tool degrades that
 section rather than failing the run, and the status file records exactly what
 did not execute.
 
-The packet capture spans all host interfaces, so external destinations include
-any host traffic during the window. Docker-network attribution is derived from
-the network subnets recorded at collect time. This is stated in the findings
-document's scope section.
+The packet capture is restricted by a BPF filter to Docker network address
+space, so traffic on the host's own interfaces is not written to the pcap. The
+filter is built at `start` from the subnets of existing Docker networks plus
+`DOCKER_NET_POOL`, which covers networks OSS-CRS creates after the capture
+begins. Container egress to external destinations is still recorded, because the
+source address is inside a Docker subnet. If other containers run on the same
+host during the window, their traffic is in scope of that filter; a dedicated
+host gives the cleanest evidence. The exact filter used is recorded in
+`RUNTIME-PROVENANCE.md`.
+
+### Campaign timing
+
+`oss-crs run` ends with an unconditional cleanup task that executes
+`docker compose down -v --rmi local --remove-orphans`, removing the containers,
+their volumes, and locally built images. There is no flag that disables this.
+The watcher exists because of it: everything that requires live containers is
+collected automatically while the campaign is running, so teardown does not cost
+you any evidence.
+
+The packet capture and Falco run continuously from `start` to `stop`, so the
+whole campaign is recorded regardless of when a collection fires, including
+everything after it. Run `stop` once the campaign and its teardown have
+finished.
 
 ---
 
