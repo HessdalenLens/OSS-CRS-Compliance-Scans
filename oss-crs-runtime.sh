@@ -67,6 +67,12 @@ DOCKER_NET_POOL="${DOCKER_NET_POOL:-172.16.0.0/12}"
 POLL_INTERVAL="${POLL_INTERVAL:-15}"   # seconds between polls
 SETTLE_POLLS="${SETTLE_POLLS:-2}"      # consecutive unchanged polls before heavy collection
 NO_WATCH="${NO_WATCH:-0}"
+# Host tools installed by this script live here and stay on PATH for every verb,
+# so the watcher and stop see the same tools start installed.
+BIN_DIR="$OUT_DIR/.tools"
+mkdir -p "$BIN_DIR" 2>/dev/null || true
+export PATH="$BIN_DIR:$PATH"
+SSG_DIR="$OUT_DIR/.ssg"
 
 log()  { printf '[*] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -79,6 +85,77 @@ need_docker() { command -v docker >/dev/null && docker info >/dev/null 2>&1 || d
 
 # digest of a pulled image, for provenance
 img_digest() { docker inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null || echo "unresolved"; }
+
+# --- Host tool acquisition --------------------------------------------------
+# Installed once at 'start' so collect and stop find them. Package names differ
+# by distribution: on Ubuntu the oscap binary ships in libopenscap8, and neither
+# openscap-scanner nor scap-security-guide exists there. Each tool is installed
+# independently so one unavailable package cannot abort the others.
+pkg_install() {
+  if command -v apt-get >/dev/null; then apt-get install -y -q "$@" >/dev/null 2>&1
+  elif command -v dnf >/dev/null; then dnf install -y -q "$@" >/dev/null 2>&1
+  elif command -v yum >/dev/null; then yum install -y -q "$@" >/dev/null 2>&1
+  else return 1; fi
+}
+
+ensure_nmap() {
+  command -v nmap >/dev/null && { status tool_nmap present; return 0; }
+  pkg_install nmap
+  command -v nmap >/dev/null && status tool_nmap installed || status tool_nmap unavailable
+}
+
+ensure_trivy() {
+  command -v trivy >/dev/null && { status tool_trivy present; return 0; }
+  # Trivy is not packaged in Ubuntu or Debian; use the vendor install script.
+  curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+    | sh -s -- -b "$BIN_DIR" >/dev/null 2>&1
+  command -v trivy >/dev/null && status tool_trivy installed || status tool_trivy unavailable
+}
+
+ensure_oscap() {
+  if ! command -v oscap >/dev/null; then
+    if command -v apt-get >/dev/null; then
+      # Ubuntu and Debian ship the oscap binary in libopenscap8.
+      pkg_install libopenscap8 || pkg_install openscap-scanner || true
+    else
+      pkg_install openscap-scanner || true
+    fi
+  fi
+  command -v oscap >/dev/null && { status tool_oscap present; return 0; }
+  status tool_oscap unavailable; return 1
+}
+
+# SCAP Security Guide content is packaged on RHEL-family but not on Ubuntu.
+# Fetch datastreams from the ComplianceAsCode release if none are installed.
+ensure_ssg() {
+  ls /usr/share/xml/scap/ssg/content/*-ds.xml >/dev/null 2>&1 && { status tool_ssg present; return 0; }
+  ls "$SSG_DIR"/*-ds.xml >/dev/null 2>&1 && { status tool_ssg cached; return 0; }
+  command -v unzip >/dev/null || pkg_install unzip || true
+  mkdir -p "$SSG_DIR"
+  local url
+  url=$(curl -sfL "https://api.github.com/repos/ComplianceAsCode/content/releases/latest" 2>/dev/null \
+        | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit()
+for a in d.get("assets",[]):
+    n=a.get("name","")
+    if n.startswith("scap-security-guide-") and n.endswith(".zip") and "doc" not in n:
+        print(a.get("browser_download_url")); break' 2>/dev/null)
+  [ -n "$url" ] || { status tool_ssg "no-release-asset"; return 1; }
+  if curl -sfL "$url" -o "$SSG_DIR/ssg.zip" 2>/dev/null && command -v unzip >/dev/null; then
+    unzip -o -j -q "$SSG_DIR/ssg.zip" '*-ds.xml' -d "$SSG_DIR" 2>/dev/null
+    rm -f "$SSG_DIR/ssg.zip"
+  fi
+  ls "$SSG_DIR"/*-ds.xml >/dev/null 2>&1 && status tool_ssg downloaded || status tool_ssg unavailable
+}
+
+ensure_host_tools() {
+  log "checking host tools (nmap, trivy, oscap, SSG content)"
+  command -v apt-get >/dev/null && { apt-get update -qq >/dev/null 2>&1 || true; }
+  ensure_nmap
+  ensure_trivy
+  if ensure_oscap; then ensure_ssg; else status tool_ssg skipped; fi
+}
 
 # BPF filter limiting the capture to Docker network address space, so traffic on
 # the host's own interfaces is never written to the pcap. Unions the subnets of
@@ -171,9 +248,14 @@ scoped_containers() {  docker ps -q | while read -r id; do
 # ============================================================================
 cmd_start() {
   need_root; need_docker
-  command -v tcpdump >/dev/null || die "tcpdump not found"
-  mkdir -p "$OUT_DIR" "$STATE" "$OUT_DIR/zeek"
+  mkdir -p "$OUT_DIR" "$STATE" "$OUT_DIR/zeek" "$BIN_DIR"
   [ -f "$STATE/started" ] && die "already started; run 'stop' first or remove $STATE"
+  if ! command -v tcpdump >/dev/null; then
+    command -v apt-get >/dev/null && { apt-get update -qq >/dev/null 2>&1 || true; }
+    pkg_install tcpdump || true
+  fi
+  command -v tcpdump >/dev/null || die "tcpdump not found and could not be installed"
+  ensure_host_tools
 
   now > "$STATE/started"
   hostname > "$STATE/host"
@@ -356,18 +438,16 @@ cmd_stop() {
 }
 
 run_openscap() {
-  if ! command -v oscap >/dev/null; then
-    if command -v apt-get >/dev/null; then apt-get install -y -q openscap-scanner ssg-base ssg-debderived >/dev/null 2>&1 || apt-get install -y -q openscap-scanner scap-security-guide >/dev/null 2>&1
-    elif command -v dnf >/dev/null; then dnf install -y -q openscap-scanner scap-security-guide >/dev/null 2>&1
-    fi
-  fi
-  command -v oscap >/dev/null || { status openscap tool-missing; return; }
+  ensure_oscap || { status openscap tool-missing; return; }
+  ensure_ssg >/dev/null 2>&1 || true
   . /etc/os-release 2>/dev/null
   DS=""
-  for cand in /usr/share/xml/scap/ssg/content/ssg-${ID}${VERSION_ID//./}-ds.xml \
-              /usr/share/xml/scap/ssg/content/ssg-${ID}-ds.xml \
-              /usr/share/xml/scap/ssg/content/ssg-rhel${VERSION_ID%%.*}-ds.xml; do
-    [ -f "$cand" ] && { DS="$cand"; break; }
+  for dir in "$SSG_DIR" /usr/share/xml/scap/ssg/content; do
+    for cand in "$dir/ssg-${ID}${VERSION_ID//./}-ds.xml" \
+                "$dir/ssg-${ID}-ds.xml" \
+                "$dir/ssg-rhel${VERSION_ID%%.*}-ds.xml"; do
+      [ -f "$cand" ] && { DS="$cand"; break 2; }
+    done
   done
   [ -n "$DS" ] || { status openscap "no-datastream-for-${ID:-unknown}"; return; }
   PROFILE=""

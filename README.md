@@ -103,18 +103,32 @@ contain, not what containers do.
 
 ### Requirements
 
-Root, and Docker with a running daemon. Also `python3` and `tcpdump`; the script
-exits if any of these are missing.
+Root, Docker with a running daemon, `python3`, and `curl`. Network access is
+required to pull the tool containers and install the host tools.
 
 Pulled automatically as containers: Falco, Zeek, Docker Bench for Security,
 OWASP ZAP.
 
-Optional host tools, used if present and recorded as `tool-missing` if not:
-`nmap`, `trivy`, `oscap` with the SCAP Security Guide. On Debian or Ubuntu:
+Installed automatically at `start`, each independently so one unavailable
+package cannot block the others: `tcpdump`, `nmap`, `trivy`, `oscap`, and SCAP
+Security Guide content. The script resolves these per distribution, which
+matters because the package names differ:
 
-```bash
-sudo apt install tcpdump nmap openscap-scanner scap-security-guide
-```
+| Tool | Debian / Ubuntu | RHEL family |
+|---|---|---|
+| nmap | `nmap` | `nmap` |
+| tcpdump | `tcpdump` | `tcpdump` |
+| oscap | `libopenscap8` | `openscap-scanner` |
+| SSG content | not packaged; downloaded from ComplianceAsCode releases | `scap-security-guide` |
+| trivy | not packaged; installed from the vendor script | not packaged; installed from the vendor script |
+
+Do not install these with a single combined `apt install` line. On Ubuntu,
+`openscap-scanner` and `scap-security-guide` do not exist, and apt aborts the
+whole transaction when any named package is unknown, so nothing gets installed
+including the packages that were valid.
+
+If a tool cannot be installed, the run continues and `RUNTIME-STATUS.txt`
+records it as `unavailable`, with that section of the findings marked accordingly.
 
 ### Usage
 
